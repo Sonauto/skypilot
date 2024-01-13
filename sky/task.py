@@ -874,13 +874,13 @@ class Task:
             if str(storage_cloud) not in enabled_storage_clouds:
                 storage_cloud = None
 
-        if storage_cloud is None:
-            storage_cloud = clouds.CLOUD_REGISTRY.from_str(
-                enabled_storage_clouds[0])
-            assert storage_cloud is not None, enabled_storage_clouds[0]
+        #if storage_cloud is None:
+        #    storage_cloud = clouds.CLOUD_REGISTRY.from_str(
+        #        enabled_storage_clouds[0])
+        #    assert storage_cloud is not None, enabled_storage_clouds[0]
 
-        store_type = storage_lib.get_storetype_from_cloud(storage_cloud)
-        return store_type
+        #store_type = storage_lib.get_storetype_from_cloud(storage_cloud)
+        return storage_lib.StoreType.R2
 
     def sync_storage_mounts(self) -> None:
         """(INTERNAL) Eagerly syncs storage mounts to cloud storage.
