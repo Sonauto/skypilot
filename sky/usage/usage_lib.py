@@ -288,8 +288,7 @@ messages = MessageCollection()
 
 def _send_to_loki(message_type: MessageType):
     """Send the message to the Grafana Loki."""
-    if env_options.Options.DISABLE_LOGGING.get():
-        return
+    return
 
     message = messages[message_type]
 
@@ -414,9 +413,9 @@ def entrypoint_context(name: str, fallback: bool = False):
         for message in messages.values():
             message.start()
         messages.usage.update_entrypoint(name)
-    if env_options.Options.DISABLE_LOGGING.get() or not is_entry:
-        yield
-        return
+    # if env_options.Options.DISABLE_LOGGING.get() or not is_entry:
+    yield
+    return
 
     # Should be the outermost entrypoint or the fallback entrypoint.
     try:
