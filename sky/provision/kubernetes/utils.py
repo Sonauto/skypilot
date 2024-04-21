@@ -32,7 +32,7 @@ MEMORY_SIZE_UNITS = {
 }
 NO_GPU_ERROR_MESSAGE = 'No GPUs found in Kubernetes cluster. \
 If your cluster contains GPUs, make sure nvidia.com/gpu resource is available on the nodes and the node labels for identifying GPUs \
-(e.g., skypilot.co/accelerators) are setup correctly. \
+(e.g., skypilot.co/accelerator) are setup correctly. \
 To further debug, run: sky check.'
 
 # TODO(romilb): Add links to docs for configuration instructions when ready.
@@ -531,7 +531,7 @@ def get_current_kube_config_context_name() -> Optional[str]:
     Returns:
         str | None: The current kubernetes context if it exists, None otherwise
     """
-    k8s = kubernetes.get_kubernetes()
+    k8s = kubernetes.kubernetes
     try:
         _, current_context = k8s.config.list_kube_config_contexts()
         return current_context['name']
@@ -546,7 +546,7 @@ def get_current_kube_config_context_namespace() -> str:
         str | None: The current kubernetes context namespace if it exists, else
             the default namespace.
     """
-    k8s = kubernetes.get_kubernetes()
+    k8s = kubernetes.kubernetes
     try:
         _, current_context = k8s.config.list_kube_config_contexts()
         if 'namespace' in current_context['context']:
@@ -812,6 +812,10 @@ def setup_ssh_jump_svc(ssh_jump_name: str, namespace: str,
     # Fill in template - ssh_key_secret and ssh_jump_image are not required for
     # the service spec, so we pass in empty strs.
     content = fill_ssh_jump_template('', '', ssh_jump_name, service_type.value)
+
+    # Add custom metadata from config
+    merge_custom_metadata(content['service_spec']['metadata'])
+
     # Create service
     try:
         kubernetes.core_api().create_namespaced_service(namespace,
@@ -885,6 +889,11 @@ def setup_ssh_jump_pod(ssh_jump_name: str, ssh_jump_image: str,
     # required, so we pass in empty str.
     content = fill_ssh_jump_template(ssh_key_secret, ssh_jump_image,
                                      ssh_jump_name, '')
+
+    # Add custom metadata to all objects
+    for object_type in content.keys():
+        merge_custom_metadata(content[object_type]['metadata'])
+
     # ServiceAccount
     try:
         kubernetes.core_api().create_namespaced_service_account(
@@ -1004,7 +1013,7 @@ def fill_ssh_jump_template(ssh_key_secret: str, ssh_jump_image: str,
     if not os.path.exists(template_path):
         raise FileNotFoundError(
             'Template "kubernetes-ssh-jump.j2" does not exist.')
-    with open(template_path) as fin:
+    with open(template_path, 'r', encoding='utf-8') as fin:
         template = fin.read()
     j2_template = jinja2.Template(template)
     cont = j2_template.render(name=ssh_jump_name,
@@ -1016,28 +1025,64 @@ def fill_ssh_jump_template(ssh_key_secret: str, ssh_jump_image: str,
 
 
 def check_port_forward_mode_dependencies() -> None:
-    """Checks if 'socat' is installed"""
-    # We store the dependency list as a list of lists. Each inner list
-    # contains the name of the dependency, the command to check if it is
-    # installed, and the package name to install it.
-    dependency_list = [['socat', ['socat', '-V'], 'socat'],
-                       ['nc', ['nc', '-h'], 'netcat']]
-    for name, check_cmd, install_cmd in dependency_list:
-        try:
-            subprocess.run(check_cmd,
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL,
-                           check=True)
-        except (FileNotFoundError, subprocess.CalledProcessError):
+    """Checks if 'socat' and 'nc' are installed"""
+
+    # Construct runtime errors
+    socat_default_error = RuntimeError(
+        f'`socat` is required to setup Kubernetes cloud with '
+        f'`{kubernetes_enums.KubernetesNetworkingMode.PORTFORWARD.value}` '  # pylint: disable=line-too-long
+        'default networking mode and it is not installed. '
+        'On Debian/Ubuntu, install it with:\n'
+        f'  $ sudo apt install socat\n'
+        f'On MacOS, install it with: \n'
+        f'  $ brew install socat')
+    netcat_default_error = RuntimeError(
+        f'`nc` is required to setup Kubernetes cloud with '
+        f'`{kubernetes_enums.KubernetesNetworkingMode.PORTFORWARD.value}` '  # pylint: disable=line-too-long
+        'default networking mode and it is not installed. '
+        'On Debian/Ubuntu, install it with:\n'
+        f'  $ sudo apt install netcat\n'
+        f'On MacOS, install it with: \n'
+        f'  $ brew install netcat')
+    mac_installed_error = RuntimeError(
+        f'The default MacOS `nc` is installed. However, for '
+        f'`{kubernetes_enums.KubernetesNetworkingMode.PORTFORWARD.value}` '  # pylint: disable=line-too-long
+        'default networking mode, GNU netcat is required. '
+        f'On MacOS, install it with: \n'
+        f'  $ brew install netcat')
+
+    # Ensure socat is installed
+    try:
+        subprocess.run(['socat', '-V'],
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL,
+                       check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        with ux_utils.print_exception_no_traceback():
+            raise socat_default_error from None
+
+    # Ensure netcat is installed
+    #
+    # In some cases, the user may have the default MacOS nc installed, which
+    # does not support the -z flag. To use the -z flag for port scanning,
+    # they need GNU nc installed. We check for this case and raise an error.
+    try:
+        netcat_output = subprocess.run(['nc', '-h'],
+                                       capture_output=True,
+                                       check=False)
+        nc_mac_installed = netcat_output.returncode == 1 and 'apple' in str(
+            netcat_output.stderr)
+
+        if nc_mac_installed:
             with ux_utils.print_exception_no_traceback():
-                raise RuntimeError(
-                    f'`{name}` is required to setup Kubernetes cloud with '
-                    f'`{kubernetes_enums.KubernetesNetworkingMode.PORTFORWARD.value}` '  # pylint: disable=line-too-long
-                    'default networking mode and it is not installed. '
-                    'On Debian/Ubuntu, install it with:\n'
-                    f'  $ sudo apt install {install_cmd}\n'
-                    f'On MacOS, install it with: \n'
-                    f'  $ brew install {install_cmd}') from None
+                raise mac_installed_error from None
+        elif netcat_output.returncode != 0:
+            with ux_utils.print_exception_no_traceback():
+                raise netcat_default_error from None
+
+    except FileNotFoundError:
+        with ux_utils.print_exception_no_traceback():
+            raise netcat_default_error from None
 
 
 def get_endpoint_debug_message() -> str:
@@ -1059,7 +1104,48 @@ def get_endpoint_debug_message() -> str:
                                           debug_cmd=debug_cmd)
 
 
-def combine_pod_config_fields(config_yaml_path: str) -> None:
+def merge_dicts(source: Dict[Any, Any], destination: Dict[Any, Any]):
+    """Merge two dictionaries into the destination dictionary.
+
+    Updates nested dictionaries instead of replacing them.
+    If a list is encountered, it will be appended to the destination list.
+
+    An exception is when the key is 'containers', in which case the
+    first container in the list will be fetched and merge_dict will be
+    called on it with the first container in the destination list.
+    """
+    for key, value in source.items():
+        if isinstance(value, dict) and key in destination:
+            merge_dicts(value, destination[key])
+        elif isinstance(value, list) and key in destination:
+            assert isinstance(destination[key], list), \
+                f'Expected {key} to be a list, found {destination[key]}'
+            if key == 'containers':
+                # If the key is 'containers', we take the first and only
+                # container in the list and merge it.
+                assert len(value) == 1, \
+                    f'Expected only one container, found {value}'
+                merge_dicts(value[0], destination[key][0])
+            elif key in ['volumes', 'volumeMounts']:
+                # If the key is 'volumes' or 'volumeMounts', we search for
+                # item with the same name and merge it.
+                for new_volume in value:
+                    new_volume_name = new_volume.get('name')
+                    if new_volume_name is not None:
+                        destination_volume = next(
+                            (v for v in destination[key]
+                             if v.get('name') == new_volume_name), None)
+                        if destination_volume is not None:
+                            merge_dicts(new_volume, destination_volume)
+                        else:
+                            destination[key].append(new_volume)
+            else:
+                destination[key].extend(value)
+        else:
+            destination[key] = value
+
+
+def combine_pod_config_fields(cluster_yaml_path: str) -> None:
     """Adds or updates fields in the YAML with fields from the ~/.sky/config's
     kubernetes.pod_spec dict.
     This can be used to add fields to the YAML that are not supported by
@@ -1098,44 +1184,90 @@ def combine_pod_config_fields(config_yaml_path: str) -> None:
                     - name: my-secret
         ```
     """
-
-    def _merge_dicts(source, destination):
-        """Merge two dictionaries.
-
-        Updates nested dictionaries instead of replacing them.
-        If a list is encountered, it will be appended to the destination list.
-
-        An exception is when the key is 'containers', in which case the
-        first container in the list will be fetched and _merge_dict will be
-        called on it with the first container in the destination list.
-        """
-        for key, value in source.items():
-            if isinstance(value, dict) and key in destination:
-                _merge_dicts(value, destination[key])
-            elif isinstance(value, list) and key in destination:
-                assert isinstance(destination[key], list), \
-                    f'Expected {key} to be a list, found {destination[key]}'
-                if key == 'containers':
-                    # If the key is 'containers', we take the first and only
-                    # container in the list and merge it.
-                    assert len(value) == 1, \
-                        f'Expected only one container, found {value}'
-                    _merge_dicts(value[0], destination[key][0])
-                else:
-                    destination[key].extend(value)
-            else:
-                destination[key] = value
-
-    with open(config_yaml_path, 'r') as f:
+    with open(cluster_yaml_path, 'r', encoding='utf-8') as f:
         yaml_content = f.read()
     yaml_obj = yaml.safe_load(yaml_content)
     kubernetes_config = skypilot_config.get_nested(('kubernetes', 'pod_config'),
                                                    {})
 
     # Merge the kubernetes config into the YAML for both head and worker nodes.
-    _merge_dicts(
+    merge_dicts(
         kubernetes_config,
         yaml_obj['available_node_types']['ray_head_default']['node_config'])
 
     # Write the updated YAML back to the file
-    common_utils.dump_yaml(config_yaml_path, yaml_obj)
+    common_utils.dump_yaml(cluster_yaml_path, yaml_obj)
+
+
+def combine_metadata_fields(cluster_yaml_path: str) -> None:
+    """Updates the metadata for all Kubernetes objects created by SkyPilot with
+    fields from the ~/.sky/config's kubernetes.custom_metadata dict.
+
+    Obeys the same add or update semantics as combine_pod_config_fields().
+    """
+
+    with open(cluster_yaml_path, 'r', encoding='utf-8') as f:
+        yaml_content = f.read()
+    yaml_obj = yaml.safe_load(yaml_content)
+    custom_metadata = skypilot_config.get_nested(
+        ('kubernetes', 'custom_metadata'), {})
+
+    # List of objects in the cluster YAML to be updated
+    combination_destinations = [
+        # Service accounts
+        yaml_obj['provider']['autoscaler_service_account']['metadata'],
+        yaml_obj['provider']['autoscaler_role']['metadata'],
+        yaml_obj['provider']['autoscaler_role_binding']['metadata'],
+        yaml_obj['provider']['autoscaler_service_account']['metadata'],
+        # Pod spec
+        yaml_obj['available_node_types']['ray_head_default']['node_config']
+        ['metadata'],
+        # Services for pods
+        *[svc['metadata'] for svc in yaml_obj['provider']['services']]
+    ]
+
+    for destination in combination_destinations:
+        merge_dicts(custom_metadata, destination)
+
+    # Write the updated YAML back to the file
+    common_utils.dump_yaml(cluster_yaml_path, yaml_obj)
+
+
+def merge_custom_metadata(original_metadata: Dict[str, Any]) -> None:
+    """Merges original metadata with custom_metadata from config
+
+    Merge is done in-place, so return is not required
+    """
+    custom_metadata = skypilot_config.get_nested(
+        ('kubernetes', 'custom_metadata'), {})
+    merge_dicts(custom_metadata, original_metadata)
+
+
+def check_nvidia_runtime_class() -> bool:
+    """Checks if the 'nvidia' RuntimeClass exists in the cluster"""
+    # Fetch the list of available RuntimeClasses
+    runtime_classes = kubernetes.node_api().list_runtime_class()
+
+    # Check if 'nvidia' RuntimeClass exists
+    nvidia_exists = any(
+        rc.metadata.name == 'nvidia' for rc in runtime_classes.items)
+    return nvidia_exists
+
+
+def check_secret_exists(secret_name: str, namespace: str) -> bool:
+    """Checks if a secret exists in a namespace
+
+    Args:
+        secret_name: Name of secret to check
+        namespace: Namespace to check
+    """
+
+    try:
+        kubernetes.core_api().read_namespaced_secret(
+            secret_name, namespace, _request_timeout=kubernetes.API_TIMEOUT)
+    except kubernetes.api_exception() as e:
+        if e.status == 404:
+            return False
+        raise
+    else:
+        return True

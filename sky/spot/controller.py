@@ -58,19 +58,28 @@ class SpotController:
         # pylint: disable=line-too-long
         # Add a unique identifier to the task environment variables, so that
         # the user can have the same id for multiple recoveries.
-        #   Example value: sky-2022-10-04-22-46-52-467694_spot_id-17-1
+        #   Example value: sky-2022-10-04-22-46-52-467694_my-spot-name_spot_id-17-0
         job_id_env_vars = []
-        for i in range(len(self._dag.tasks)):
+        for i, task in enumerate(self._dag.tasks):
+            if len(self._dag.tasks) <= 1:
+                task_name = self._dag_name
+            else:
+                task_name = task.name
+                # This is guaranteed by the spot_launch API, where we fill in
+                # the task.name with
+                # dag_utils.maybe_infer_and_fill_dag_and_task_names.
+                assert task_name is not None, self._dag
+                task_name = f'{self._dag_name}_{task_name}'
             job_id_env_var = common_utils.get_global_job_id(
                 self._backend.run_timestamp,
-                'spot',
+                f'{task_name}',
                 str(self._job_id),
-                task_id=i)
+                task_id=i,
+                is_managed_job=True)
             job_id_env_vars.append(job_id_env_var)
 
         for i, task in enumerate(self._dag.tasks):
             task_envs = task.envs or {}
-            task_envs[constants.TASK_ID_ENV_VAR_DEPRECATED] = job_id_env_vars[i]
             task_envs[constants.TASK_ID_ENV_VAR] = job_id_env_vars[i]
             task_envs[constants.TASK_ID_LIST_ENV_VAR] = '\n'.join(
                 job_id_env_vars)
@@ -386,11 +395,8 @@ def _handle_signal(job_id):
     if signal_file.exists():
         # Filelock is needed to prevent race condition with concurrent
         # signal writing.
-        # TODO(mraheja): remove pylint disabling when filelock version
-        # updated
-        # pylint: disable=abstract-class-instantiated
         with filelock.FileLock(str(signal_file) + '.lock'):
-            with signal_file.open(mode='r') as f:
+            with signal_file.open(mode='r', encoding='utf-8') as f:
                 user_signal = f.read().strip()
                 try:
                     user_signal = spot_utils.UserSignal(user_signal)

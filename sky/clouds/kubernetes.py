@@ -5,8 +5,8 @@ import typing
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from sky import clouds
-from sky import exceptions
 from sky import sky_logging
+from sky import skypilot_config
 from sky.adaptors import kubernetes
 from sky.clouds import service_catalog
 from sky.provision.kubernetes import network_utils
@@ -20,15 +20,19 @@ if typing.TYPE_CHECKING:
 
 logger = sky_logging.init_logger(__name__)
 
-CREDENTIAL_PATH = '~/.kube/config'
+# Check if KUBECONFIG is set, and use it if it is.
+DEFAULT_KUBECONFIG_PATH = '~/.kube/config'
+CREDENTIAL_PATH = os.environ.get('KUBECONFIG', DEFAULT_KUBECONFIG_PATH)
 
 
 @clouds.CLOUD_REGISTRY.register
 class Kubernetes(clouds.Cloud):
     """Kubernetes."""
 
-    SKY_SSH_KEY_SECRET_NAME = f'sky-ssh-{common_utils.get_user_hash()}'
-    SKY_SSH_JUMP_NAME = f'sky-ssh-jump-{common_utils.get_user_hash()}'
+    SKY_SSH_KEY_SECRET_NAME = 'sky-ssh-keys'
+    SKY_SSH_KEY_SECRET_FIELD_NAME = \
+        f'ssh-publickey-{common_utils.get_user_hash()}'
+    SKY_SSH_JUMP_NAME = 'sky-ssh-jump-pod'
     PORT_FORWARD_PROXY_CMD_TEMPLATE = \
         'kubernetes-port-forward-proxy-command.sh.j2'
     PORT_FORWARD_PROXY_CMD_PATH = '~/.sky/port-forward-proxy-cmd.sh'
@@ -39,8 +43,8 @@ class Kubernetes(clouds.Cloud):
     # Note that this timeout includes time taken by the Kubernetes scheduler
     # itself, which can be upto 2-3 seconds.
     # For non-autoscaling clusters, we conservatively set this to 10s.
-    # TODO(romilb): Make the timeout configurable.
-    TIMEOUT = 10
+    timeout = skypilot_config.get_nested(['kubernetes', 'provision_timeout'],
+                                         10)
 
     _DEFAULT_NUM_VCPUS = 2
     _DEFAULT_MEMORY_CPU_RATIO = 1
@@ -61,6 +65,13 @@ class Kubernetes(clouds.Cloud):
                                                              'tiers are not '
                                                              'supported in '
                                                              'Kubernetes.',
+        # Kubernetes may be using exec-based auth, which may not work by
+        # directly copying the kubeconfig file to the controller.
+        # Support for service accounts for auth will be added in #3377, which
+        # will allow us to support hosting controllers.
+        clouds.CloudImplementationFeatures.HOST_CONTROLLERS: 'Kubernetes can '
+                                                             'not host '
+                                                             'controllers.',
     }
 
     IMAGE_CPU = 'skypilot:cpu-ubuntu-2004'
@@ -74,16 +85,6 @@ class Kubernetes(clouds.Cloud):
         cls, resources: 'resources_lib.Resources'
     ) -> Dict[clouds.CloudImplementationFeatures, str]:
         unsupported_features = cls._CLOUD_UNSUPPORTED_FEATURES
-        curr_context = kubernetes_utils.get_current_kube_config_context_name()
-        if curr_context == kubernetes_utils.KIND_CONTEXT_NAME:
-            # If we are using KIND, the loadbalancer service will never be
-            # assigned an external IP. Users may use ingress, but that requires
-            # blocking HTTP port 80.
-            # For now, we disable port opening feature on kind clusters.
-            unsupported_features[
-                clouds.CloudImplementationFeatures.OPEN_PORTS] = (
-                    'Opening ports is not supported in Kubernetes when '
-                    'using local kind cluster.')
         return unsupported_features
 
     @classmethod
@@ -143,8 +144,15 @@ class Kubernetes(clouds.Cloud):
         # exactly the requested resources.
         instance_cpus = float(
             cpus.strip('+')) if cpus is not None else cls._DEFAULT_NUM_VCPUS
-        instance_mem = float(memory.strip('+')) if memory is not None else \
-            instance_cpus * cls._DEFAULT_MEMORY_CPU_RATIO
+        if memory is not None:
+            if memory.endswith('+'):
+                instance_mem = float(memory[:-1])
+            elif memory.endswith('x'):
+                instance_mem = float(memory[:-1]) * instance_cpus
+            else:
+                instance_mem = float(memory)
+        else:
+            instance_mem = instance_cpus * cls._DEFAULT_MEMORY_CPU_RATIO
         virtual_instance_type = kubernetes_utils.KubernetesInstanceType(
             instance_cpus, instance_mem).name
         return virtual_instance_type
@@ -195,10 +203,13 @@ class Kubernetes(clouds.Cloud):
         return 0
 
     def make_deploy_resources_variables(
-            self, resources: 'resources_lib.Resources',
-            cluster_name_on_cloud: str, region: Optional['clouds.Region'],
-            zones: Optional[List['clouds.Zone']]) -> Dict[str, Optional[str]]:
-        del cluster_name_on_cloud, zones  # Unused.
+            self,
+            resources: 'resources_lib.Resources',
+            cluster_name_on_cloud: str,
+            region: Optional['clouds.Region'],
+            zones: Optional[List['clouds.Zone']],
+            dryrun: bool = False) -> Dict[str, Optional[str]]:
+        del cluster_name_on_cloud, zones, dryrun  # Unused.
         if region is None:
             region = self._regions[0]
 
@@ -221,8 +232,9 @@ class Kubernetes(clouds.Cloud):
 
         if resources.image_id is not None:
             # Use custom image specified in resources
-            image_id_with_region = resources.image_id['kubernetes']
-            image_id = image_id_with_region.lstrip('docker:')
+            image_id = resources.image_id['kubernetes']
+            if image_id.startswith('docker:'):
+                image_id = image_id[len('docker:'):]
         else:
             # Select image based on whether we are using GPUs or not.
             image_id = self.IMAGE_GPU if acc_count > 0 else self.IMAGE_CPU
@@ -250,7 +262,7 @@ class Kubernetes(clouds.Cloud):
             'cpus': str(cpus),
             'memory': str(mem),
             'accelerator_count': str(acc_count),
-            'timeout': str(self.TIMEOUT),
+            'timeout': str(self.timeout),
             'k8s_namespace':
                 kubernetes_utils.get_current_kube_config_context_namespace(),
             'k8s_port_mode': port_mode.value,
@@ -259,7 +271,6 @@ class Kubernetes(clouds.Cloud):
             'k8s_acc_label_value': k8s_acc_label_value,
             'k8s_ssh_jump_name': self.SKY_SSH_JUMP_NAME,
             'k8s_ssh_jump_image': ssh_jump_image,
-            # TODO(romilb): Allow user to specify custom images
             'image_id': image_id,
         }
 
@@ -341,7 +352,12 @@ class Kubernetes(clouds.Cloud):
                     f'check if {CREDENTIAL_PATH} exists.')
 
     def get_credential_file_mounts(self) -> Dict[str, str]:
-        return {CREDENTIAL_PATH: CREDENTIAL_PATH}
+        if os.path.exists(os.path.expanduser(CREDENTIAL_PATH)):
+            # Upload kubeconfig to the default path to avoid having to set
+            # KUBECONFIG in the environment.
+            return {DEFAULT_KUBECONFIG_PATH: CREDENTIAL_PATH}
+        else:
+            return {}
 
     def instance_type_exists(self, instance_type: str) -> bool:
         return kubernetes_utils.KubernetesInstanceType.is_valid_instance_type(
@@ -357,21 +373,9 @@ class Kubernetes(clouds.Cloud):
                              ' Cluster used is determined by the kubeconfig.')
         return region, zone
 
-    def accelerator_in_region_or_zone(self,
-                                      accelerator: str,
-                                      acc_count: int,
-                                      region: Optional[str] = None,
-                                      zone: Optional[str] = None) -> bool:
-        try:
-            # Check if accelerator is available by checking node labels
-            _, _ = kubernetes_utils.get_gpu_label_key_value(accelerator)
-            return True
-        except exceptions.ResourcesUnavailableError:
-            return False
-
     @classmethod
     def get_current_user_identity(cls) -> Optional[List[str]]:
-        k8s = kubernetes.get_kubernetes()
+        k8s = kubernetes.kubernetes
         try:
             _, current_context = k8s.config.list_kube_config_contexts()
             if 'namespace' in current_context['context']:
