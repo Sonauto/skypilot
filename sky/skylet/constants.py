@@ -42,11 +42,11 @@ SKY_RAY_CMD = (f'$([ -s {SKY_RAY_PATH_FILE} ] && '
 
 # The name for the environment variable that stores the unique ID of the
 # current task. This will stay the same across multiple recoveries of the
-# same spot task.
+# same managed task.
 TASK_ID_ENV_VAR = 'SKYPILOT_TASK_ID'
 # This environment variable stores a '\n'-separated list of task IDs that
-# are within the same spot job (DAG). This can be used by the user to
-# retrieve the task IDs of any tasks that are within the same spot job.
+# are within the same managed job (DAG). This can be used by the user to
+# retrieve the task IDs of any tasks that are within the same managed job.
 # This environment variable is pre-assigned before any task starts
 # running within the same job, and will remain constant throughout the
 # lifetime of the job.
@@ -66,9 +66,9 @@ SKYLET_VERSION = '8'
 SKYLET_LIB_VERSION = 1
 SKYLET_VERSION_FILE = '~/.sky/skylet_version'
 
-# `sky spot dashboard`-related
+# `sky jobs dashboard`-related
 #
-# Port on the remote spot controller that the dashboard is running on.
+# Port on the remote jobs controller that the dashboard is running on.
 SPOT_DASHBOARD_REMOTE_PORT = 5000
 
 # Docker default options
@@ -91,15 +91,18 @@ DOCKER_LOGIN_ENV_VARS = {
 # AWS's Deep Learning AMI's default conda environment.
 CONDA_INSTALLATION_COMMANDS = (
     'which conda > /dev/null 2>&1 || '
-    '(wget -nc https://repo.anaconda.com/miniconda/Miniconda3-py310_23.11.0-2-Linux-x86_64.sh -O Miniconda3-Linux-x86_64.sh && '  # pylint: disable=line-too-long
+    '{ wget -nc https://repo.anaconda.com/miniconda/Miniconda3-py310_23.11.0-2-Linux-x86_64.sh -O Miniconda3-Linux-x86_64.sh && '  # pylint: disable=line-too-long
     'bash Miniconda3-Linux-x86_64.sh -b && '
     'eval "$(~/miniconda3/bin/conda shell.bash hook)" && conda init && '
-    'conda config --set auto_activate_base true); '
-    'grep "# >>> conda initialize >>>" ~/.bashrc || conda init;'
+    'conda config --set auto_activate_base true && '
+    # Use $(echo ~) instead of ~ to avoid the error "no such file or directory".
+    # Also, not using $HOME to avoid the error HOME variable not set.
+    f'echo "$(echo ~)/miniconda3/bin/python" > {SKY_PYTHON_PATH_FILE}; }}; '
+    'grep "# >>> conda initialize >>>" ~/.bashrc || '
+    '{ conda init && source ~/.bashrc; };'
     '(type -a python | grep -q python3) || '
     'echo \'alias python=python3\' >> ~/.bashrc;'
     '(type -a pip | grep -q pip3) || echo \'alias pip=pip3\' >> ~/.bashrc;'
-    'source ~/.bashrc;'
     # Writes Python path to file if it does not exist or the file is empty.
     f'[ -s {SKY_PYTHON_PATH_FILE} ] || which python3 > {SKY_PYTHON_PATH_FILE};')
 
@@ -160,7 +163,7 @@ RAY_SKYPILOT_INSTALLATION_COMMANDS = (
 
 # The name for the environment variable that stores SkyPilot user hash, which
 # is mainly used to make sure sky commands runs on a VM launched by SkyPilot
-# will be recognized as the same user (e.g., spot controller or sky serve
+# will be recognized as the same user (e.g., jobs controller or sky serve
 # controller).
 USER_ID_ENV_VAR = 'SKYPILOT_USER_ID'
 
@@ -187,11 +190,11 @@ FILE_MOUNTS_REMOTE_TMP_DIR = '/tmp/sky-{}-filemounts-files'
 # TODO(tian): Refactor to controller_utils. Current blocker: circular import.
 CONTROLLER_IDLE_MINUTES_TO_AUTOSTOP = 10
 
-# Due to the CPU/memory usage of the controller process launched with sky job (
-# use ray job under the hood), we need to reserve some CPU/memory for each spot/
+# Due to the CPU/memory usage of the controller process launched with sky jobs (
+# use ray job under the hood), we need to reserve some CPU/memory for each jobs/
 # serve controller process.
-# Spot: A default controller with 8 vCPU and 32 GB memory can manage up to 32
-# spot jobs.
+# Jobs: A default controller with 8 vCPU and 32 GB memory can manage up to 32
+# managed jobs.
 # Serve: A default controller with 4 vCPU and 16 GB memory can run up to 16
 # services.
 CONTROLLER_PROCESS_CPU_DEMAND = 0.25
