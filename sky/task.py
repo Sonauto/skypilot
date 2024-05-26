@@ -915,16 +915,16 @@ class Task:
             if str(storage_cloud) not in enabled_storage_clouds:
                 storage_cloud = None
 
-        # storage_cloud_str = None
-        # if storage_cloud is None:
-        #     storage_cloud_str = enabled_storage_clouds[0]
-        #     assert storage_cloud_str is not None, enabled_storage_clouds[0]
-        #     storage_region = None  # Use default region in the Store class
-        # else:
-        #     storage_cloud_str = str(storage_cloud)
+        storage_cloud_str = None
+        if storage_cloud is None:
+            storage_cloud_str = enabled_storage_clouds[0]
+            assert storage_cloud_str is not None, enabled_storage_clouds[0]
+            storage_region = None  # Use default region in the Store class
+        else:
+            storage_cloud_str = str(storage_cloud)
 
-        # store_type = storage_lib.StoreType.from_cloud(storage_cloud_str)
-        return storage_lib.StoreType.R2, storage_region
+        store_type = storage_lib.StoreType.from_cloud(storage_cloud_str)
+        return store_type, storage_region
 
     def sync_storage_mounts(self) -> None:
         """(INTERNAL) Eagerly syncs storage mounts to cloud storage.
