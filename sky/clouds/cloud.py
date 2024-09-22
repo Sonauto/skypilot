@@ -93,12 +93,31 @@ class StatusVersion(enum.Enum):
         return self.value >= other.value
 
 
+class OpenPortsVersion(enum.Enum):
+    """The version of the open ports implementation.
+
+    1: Open ports on launching of the cluster only, cannot be modified after
+    provisioning of the cluster. This is for clouds like RunPod which only
+    accepts port argument on VM creation API, and requires Web GUI and an VM
+    restart to update ports. We currently do not support this.
+    2: Open ports after provisioning of the cluster, updatable. This is for most
+    of the cloud providers which allow opening ports using an programmable API
+    and won't affect the running VMs.
+    """
+    LAUNCH_ONLY = 'LAUNCH ONLY'
+    UPDATABLE = 'UPDATABLE'
+
+    def __le__(self, other):
+        versions = list(OpenPortsVersion)
+        return versions.index(self) <= versions.index(other)
+
+
 class Cloud:
     """A cloud provider."""
 
     _REPR = '<Cloud>'
     _DEFAULT_DISK_TIER = resources_utils.DiskTier.MEDIUM
-    _BEST_DISK_TIER = resources_utils.DiskTier.HIGH
+    _BEST_DISK_TIER = resources_utils.DiskTier.ULTRA
     _SUPPORTED_DISK_TIERS = {resources_utils.DiskTier.BEST}
     _SUPPORTS_SERVICE_ACCOUNT_ON_REMOTE = False
 
@@ -107,6 +126,7 @@ class Cloud:
     # NOTE: new clouds being added should use the latest version, i.e. SKYPILOT.
     PROVISIONER_VERSION = ProvisionerVersion.RAY_AUTOSCALER
     STATUS_VERSION = StatusVersion.CLOUD_CLI
+    OPEN_PORTS_VERSION = OpenPortsVersion.UPDATABLE
 
     @classmethod
     def max_cluster_name_length(cls) -> Optional[int]:
@@ -156,6 +176,11 @@ class Cloud:
             `region.zones` is an empty list.
         """
         raise NotImplementedError
+
+    @classmethod
+    def optimize_by_zone(cls) -> bool:
+        """Returns whether to optimize this cloud by zone (default: region)."""
+        return False
 
     @classmethod
     def zones_provision_loop(
@@ -253,7 +278,7 @@ class Cloud:
     def make_deploy_resources_variables(
         self,
         resources: 'resources_lib.Resources',
-        cluster_name_on_cloud: str,
+        cluster_name: resources_utils.ClusterName,
         region: 'Region',
         zones: Optional[List['Zone']],
         dryrun: bool = False,
@@ -341,11 +366,10 @@ class Cloud:
         return True, None
 
     def get_feasible_launchable_resources(
-        self,
-        resources: 'resources_lib.Resources',
-        num_nodes: int = 1
-    ) -> Tuple[List['resources_lib.Resources'], List[str]]:
-        """Returns ([feasible and launchable resources], [fuzzy candidates]).
+            self,
+            resources: 'resources_lib.Resources',
+            num_nodes: int = 1) -> 'resources_utils.FeasibleResources':
+        """Returns FeasibleResources for the given resources.
 
         Feasible resources refer to an offering respecting the resource
         requirements.  Currently, this function implements "filtering" the
@@ -353,10 +377,15 @@ class Cloud:
 
         Launchable resources require a cloud and an instance type be assigned.
 
-        Fuzzy candidates example: when the requested GPU is A100:1 but is not
-        available in a cloud/region, the fuzzy candidates are results of a fuzzy
-        search in the catalog that are offered in the location. E.g.,
-          ['A100-80GB:1', 'A100-80GB:2', 'A100-80GB:4', 'A100:8']
+        The returned dataclass object FeasibleResources contains three fields:
+
+        - resources_list: a list of resources that are feasible to launch
+        - fuzzy_candidate_list: a list of resources that loosely match requested
+            resources. E.g., when A100:1 GPU is requested but is not available
+            in a cloud/region, the fuzzy candidates are results of a fuzzy
+            search in the catalog that are offered in the location. E.g.,
+            ['A100-80GB:1', 'A100-80GB:2', 'A100-80GB:4', 'A100:8']
+        - hint: an optional string hint if no feasible resources are found.
         """
         if resources.is_launchable():
             self._check_instance_type_accelerators_combination(resources)
@@ -372,13 +401,18 @@ class Cloud:
             # TODO(zhwu): The resources are now silently filtered out. We
             # should have some logging telling the user why the resources
             # are not considered.
-            return ([], [])
+            return resources_utils.FeasibleResources(resources_list=[],
+                                                     fuzzy_candidate_list=[],
+                                                     hint=None)
         return self._get_feasible_launchable_resources(resources)
 
     def _get_feasible_launchable_resources(
         self, resources: 'resources_lib.Resources'
-    ) -> Tuple[List['resources_lib.Resources'], List[str]]:
+    ) -> 'resources_utils.FeasibleResources':
         """See get_feasible_launchable_resources()."""
+        # TODO: Currently only the Kubernetes implementation of this method
+        #  returns hints when no feasible resources are found. This should be
+        #  implemented for all clouds.
         raise NotImplementedError
 
     def get_reservations_available_resources(
@@ -407,11 +441,11 @@ class Cloud:
 
     # TODO(zhwu): Make the return type immutable.
     @classmethod
-    def get_current_user_identity(cls) -> Optional[List[str]]:
-        """(Advanced) Returns currently active user identity of this cloud.
+    def get_user_identities(cls) -> Optional[List[List[str]]]:
+        """(Advanced) Returns all available user identities of this cloud.
 
         The user "identity" is associated with each SkyPilot cluster they
-        creates. This is used in protecting cluster operations, such as
+        create. This is used in protecting cluster operations, such as
         provision, teardown and status refreshing, in a multi-identity
         scenario, where the same user/device can switch between different
         cloud identities. We check that the user identity matches before:
@@ -419,10 +453,16 @@ class Cloud:
             - Stopping/tearing down a cluster
             - Refreshing the status of a cluster
 
-        Design choice: we allow the operations that can correctly work with
-        a different user identity, as a user should have full control over
-        all their clusters (no matter which identity it belongs to), e.g.,
-        submitting jobs, viewing logs, auto-stopping, etc.
+        Design choices:
+          1. We allow the operations that can correctly work with a different
+             user identity, as a user should have full control over all their
+             clusters (no matter which identity it belongs to), e.g.,
+             submitting jobs, viewing logs, auto-stopping, etc.
+          2. A cloud implementation can optionally switch between different
+             identities if required for cluster operations. In this case,
+             the cloud implementation should return multiple identities
+             as a list. E.g., our Kubernetes implementation can use multiple
+             kubeconfig contexts to switch between different identities.
 
         The choice of what constitutes an identity is up to each cloud's
         implementation. In general, to suffice for the above purposes,
@@ -430,24 +470,34 @@ class Cloud:
         resources are used when the user invoked each cloud's default
         CLI/API.
 
-        The returned identity is a list of strings. The list is in the order of
+        An identity is a list of strings. The list is in the order of
         strictness, i.e., the first element is the most strict identity, and
         the last element is the least strict identity.
         When performing an identity check between the current active identity
         and the owner identity associated with a cluster, we compare the two
         lists in order: if a position does not match, we go to the next. To
-        see an example, see the docstring of the AWS.get_current_user_identity.
-
+        see an example, see the docstring of the AWS.get_user_identities.
 
         Example identities (see cloud implementations):
             - AWS: [UserId, AccountId]
             - GCP: [email address + project ID]
             - Azure: [email address + subscription ID]
+            - Kubernetes: [context name]
+
+        Example return values:
+            - AWS: [[UserId, AccountId]]
+            - GCP: [[email address + project ID]]
+            - Azure: [[email address + subscription ID]]
+            - Kubernetes: [[current active context], [context 2], ...]
 
         Returns:
             None if the cloud does not have a concept of user identity
             (access protection will be disabled for these clusters);
-            otherwise the currently active user identity.
+            otherwise a list of available identities with the current active
+            identity being the first element. Most clouds have only one identity
+            available, so the returned list will only have one element: the
+            current active identity.
+
         Raises:
             exceptions.CloudUserIdentityError: If the user identity cannot be
                 retrieved.
@@ -455,12 +505,25 @@ class Cloud:
         return None
 
     @classmethod
-    def get_current_user_identity_str(cls) -> Optional[str]:
-        """Returns a user friendly representation of the current identity."""
-        user_identity = cls.get_current_user_identity()
+    def get_active_user_identity_str(cls) -> Optional[str]:
+        """Returns a user friendly representation of the active identity."""
+        user_identity = cls.get_active_user_identity()
         if user_identity is None:
             return None
         return ', '.join(user_identity)
+
+    @classmethod
+    def get_active_user_identity(cls) -> Optional[List[str]]:
+        """Returns currently active user identity of this cloud
+
+        See get_user_identities for definition of user identity.
+
+        Returns:
+            None if the cloud does not have a concept of user identity;
+            otherwise the current active identity.
+        """
+        identities = cls.get_user_identities()
+        return identities[0] if identities is not None else None
 
     def get_credential_file_mounts(self) -> Dict[str, str]:
         """Returns the files necessary to access this cloud.
@@ -726,8 +789,8 @@ class Cloud:
     # cloud._cloud_unsupported_features().
 
     @classmethod
-    def create_image_from_cluster(cls, cluster_name: str,
-                                  cluster_name_on_cloud: str,
+    def create_image_from_cluster(cls,
+                                  cluster_name: resources_utils.ClusterName,
                                   region: Optional[str],
                                   zone: Optional[str]) -> str:
         """Creates an image from the cluster.

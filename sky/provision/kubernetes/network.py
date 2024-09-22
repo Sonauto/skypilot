@@ -1,6 +1,7 @@
 """Kubernetes network provisioning."""
 from typing import Any, Dict, List, Optional
 
+from sky import sky_logging
 from sky.adaptors import kubernetes
 from sky.provision import common
 from sky.provision.kubernetes import network_utils
@@ -8,8 +9,10 @@ from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.utils import kubernetes_enums
 from sky.utils.resources_utils import port_ranges_to_set
 
-_PATH_PREFIX = '/skypilot/{cluster_name_on_cloud}/{port}'
-_LOADBALANCER_SERVICE_NAME = '{cluster_name_on_cloud}-skypilot-loadbalancer'
+logger = sky_logging.init_logger(__name__)
+
+_PATH_PREFIX = '/skypilot/{namespace}/{cluster_name_on_cloud}/{port}'
+_LOADBALANCER_SERVICE_NAME = '{cluster_name_on_cloud}--skypilot-lb'
 
 
 def open_ports(
@@ -55,7 +58,8 @@ def _open_ports_using_loadbalancer(
     kubernetes_utils.merge_custom_metadata(content['service_spec']['metadata'])
 
     network_utils.create_or_replace_namespaced_service(
-        namespace=provider_config.get('namespace', 'default'),
+        namespace=kubernetes_utils.get_namespace_from_config(provider_config),
+        context=kubernetes_utils.get_context_from_config(provider_config),
         service_name=service_name,
         service_spec=content['service_spec'])
 
@@ -65,21 +69,23 @@ def _open_ports_using_ingress(
     ports: List[int],
     provider_config: Dict[str, Any],
 ) -> None:
+    context = kubernetes_utils.get_context_from_config(provider_config)
     # Check if an ingress controller exists
-    if not network_utils.ingress_controller_exists():
+    if not network_utils.ingress_controller_exists(context):
         raise Exception(
             'Ingress controller not found. '
             'Install Nginx ingress controller first: '
             'https://github.com/kubernetes/ingress-nginx/blob/main/docs/deploy/index.md.'  # pylint: disable=line-too-long
         )
 
-    # Prepare service names, ports, for template rendering
-    service_details = [
-        (f'{cluster_name_on_cloud}-skypilot-service--{port}', port,
-         _PATH_PREFIX.format(cluster_name_on_cloud=cluster_name_on_cloud,
-                             port=port).rstrip('/').lstrip('/'))
-        for port in ports
-    ]
+    # Prepare service names, ports,  for template rendering
+    service_details = [(f'{cluster_name_on_cloud}--skypilot-svc--{port}', port,
+                        _PATH_PREFIX.format(
+                            cluster_name_on_cloud=cluster_name_on_cloud,
+                            port=port,
+                            namespace=kubernetes_utils.
+                            get_current_kube_config_context_namespace()).rstrip(
+                                '/').lstrip('/')) for port in ports]
 
     # Generate ingress and services specs
     # We batch ingress rule creation because each rule triggers a hot reload of
@@ -104,7 +110,9 @@ def _open_ports_using_ingress(
         # Update metadata from config
         kubernetes_utils.merge_custom_metadata(service_spec['metadata'])
         network_utils.create_or_replace_namespaced_service(
-            namespace=provider_config.get('namespace', 'default'),
+            namespace=kubernetes_utils.get_namespace_from_config(
+                provider_config),
+            context=kubernetes_utils.get_context_from_config(provider_config),
             service_name=service_name,
             service_spec=service_spec,
         )
@@ -112,7 +120,8 @@ def _open_ports_using_ingress(
     kubernetes_utils.merge_custom_metadata(content['ingress_spec']['metadata'])
     # Create or update the single ingress for all services
     network_utils.create_or_replace_namespaced_ingress(
-        namespace=provider_config.get('namespace', 'default'),
+        namespace=kubernetes_utils.get_namespace_from_config(provider_config),
+        context=kubernetes_utils.get_context_from_config(provider_config),
         ingress_name=f'{cluster_name_on_cloud}-skypilot-ingress',
         ingress_spec=content['ingress_spec'],
     )
@@ -160,7 +169,7 @@ def _cleanup_ports_for_ingress(
 ) -> None:
     # Delete services for each port
     for port in ports:
-        service_name = f'{cluster_name_on_cloud}-skypilot-service--{port}'
+        service_name = f'{cluster_name_on_cloud}--skypilot-svc--{port}'
         network_utils.delete_namespaced_service(
             namespace=provider_config.get('namespace', 'default'),
             service_name=service_name,
@@ -169,7 +178,8 @@ def _cleanup_ports_for_ingress(
     # Delete the single ingress used for all ports
     ingress_name = f'{cluster_name_on_cloud}-skypilot-ingress'
     network_utils.delete_namespaced_ingress(
-        namespace=provider_config.get('namespace', 'default'),
+        namespace=kubernetes_utils.get_namespace_from_config(provider_config),
+        context=kubernetes_utils.get_context_from_config(provider_config),
         ingress_name=ingress_name,
     )
 
@@ -217,12 +227,17 @@ def _query_ports_for_loadbalancer(
     ports: List[int],
     provider_config: Dict[str, Any],
 ) -> Dict[int, List[common.Endpoint]]:
+    logger.debug(f'Getting loadbalancer IP for cluster {cluster_name_on_cloud}')
     result: Dict[int, List[common.Endpoint]] = {}
     service_name = _LOADBALANCER_SERVICE_NAME.format(
         cluster_name_on_cloud=cluster_name_on_cloud)
     external_ip = network_utils.get_loadbalancer_ip(
         namespace=provider_config.get('namespace', 'default'),
-        service_name=service_name)
+        service_name=service_name,
+        # Timeout is set so that we can retry the query when the
+        # cluster is firstly created and the load balancer is not ready yet.
+        timeout=60,
+    )
 
     if external_ip is None:
         return {}
@@ -245,7 +260,10 @@ def _query_ports_for_ingress(
     result: Dict[int, List[common.Endpoint]] = {}
     for port in ports:
         path_prefix = _PATH_PREFIX.format(
-            cluster_name_on_cloud=cluster_name_on_cloud, port=port)
+            cluster_name_on_cloud=cluster_name_on_cloud,
+            port=port,
+            namespace=kubernetes_utils.
+            get_current_kube_config_context_namespace())
 
         http_port, https_port = external_ports \
             if external_ports is not None else (None, None)

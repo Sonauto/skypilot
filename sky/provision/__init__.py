@@ -155,6 +155,10 @@ def query_ports(
     return the endpoint without querying the cloud provider. If head_ip is not
     provided, the cloud provider will be queried to get the endpoint info.
 
+    The underlying implementation is responsible for retries and timeout, e.g.
+    kubernetes will wait for the service that expose the ports to be ready
+    before returning the endpoint info.
+
     Returns a dict with port as the key and a list of common.Endpoint.
     """
     del provider_name, provider_config, cluster_name_on_cloud  # unused
@@ -182,12 +186,12 @@ def get_cluster_info(
 def get_command_runners(
     provider_name: str,
     cluster_info: common.ClusterInfo,
-    **crednetials: Dict[str, Any],
+    **credentials: Dict[str, Any],
 ) -> List[command_runner.CommandRunner]:
     """Get a command runner for the given cluster."""
     ip_list = cluster_info.get_feasible_ips()
     port_list = cluster_info.get_ssh_ports()
     return command_runner.SSHCommandRunner.make_runner_list(
         node_list=zip(ip_list, port_list),
-        **crednetials,
+        **credentials,
     )

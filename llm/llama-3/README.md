@@ -5,7 +5,7 @@
 
 
 <p align="center">
-<img src="https://imgur.com/1NEZs9f.png" alt="Llama-3 x SkyPilot" style="width: 50%;">
+<img src="https://i.imgur.com/1NEZs9f.png" alt="Llama-3 x SkyPilot" style="width: 50%;">
 </p>
 
 [Llama-3](https://github.com/meta-llama/llama3) is the latest top open-source LLM from Meta. It has been released with a license that authorizes commercial use. You can deploy a private Llama-3 chatbot with SkyPilot in your own cloud with just one simple command.
@@ -74,10 +74,10 @@ setup: |
     conda activate vllm
   fi
 
-  pip install vllm==0.4.0.post1
+  pip install vllm==0.4.2
   # Install Gradio for web UI.
   pip install gradio openai
-  pip install flash-attn==2.5.7
+  pip install flash-attn==2.5.9.post1
 
 
 run: |
@@ -226,7 +226,7 @@ ENDPOINT=$(sky status --endpoint 8081 llama3)
 curl http://$ENDPOINT/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "meta-llama/Meta-Llama-3-8B-Instruct",
+    "model": "meta-llama/Meta-Llama-3-70B-Instruct",
     "messages": [
       {
         "role": "system",
@@ -248,7 +248,7 @@ To use the Gradio UI, open the URL shown in the logs:
 
 
 <p align="center">
-<img src="https://imgur.com/zPpY2Bg.gif" alt="Gradio UI serving Llama-3" style="width: 80%;">
+<img src="https://i.imgur.com/zPpY2Bg.gif" alt="Gradio UI serving Llama-3" style="width: 80%;">
 </p>
 
 To stop the instance:

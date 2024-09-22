@@ -42,7 +42,9 @@ class OCI(clouds.Cloud):
 
     _INDENT_PREFIX = '    '
 
-    _SUPPORTED_DISK_TIERS = set(resources_utils.DiskTier)
+    _SUPPORTED_DISK_TIERS = (set(resources_utils.DiskTier) -
+                             {resources_utils.DiskTier.ULTRA})
+    _BEST_DISK_TIER = resources_utils.DiskTier.HIGH
 
     @classmethod
     def _unsupported_features_for_resources(
@@ -187,11 +189,11 @@ class OCI(clouds.Cloud):
     def make_deploy_resources_variables(
             self,
             resources: 'resources_lib.Resources',
-            cluster_name_on_cloud: str,
+            cluster_name: resources_utils.ClusterName,
             region: Optional['clouds.Region'],
             zones: Optional[List['clouds.Zone']],
             dryrun: bool = False) -> Dict[str, Optional[str]]:
-        del cluster_name_on_cloud, dryrun  # Unused.
+        del cluster_name, dryrun  # Unused.
         assert region is not None, resources
 
         acc_dict = self.get_accelerators_from_instance_type(
@@ -295,11 +297,13 @@ class OCI(clouds.Cloud):
 
     def _get_feasible_launchable_resources(
         self, resources: 'resources_lib.Resources'
-    ) -> Tuple[List['resources_lib.Resources'], List[str]]:
+    ) -> 'resources_utils.FeasibleResources':
         if resources.instance_type is not None:
             assert resources.is_launchable(), resources
             resources = resources.copy(accelerators=None)
-            return ([resources], [])
+            # TODO: Add hints to all return values in this method to help
+            #  users understand why the resources are not launchable.
+            return resources_utils.FeasibleResources([resources], [], None)
 
         def _make(instance_list):
             resource_list = []
@@ -326,9 +330,10 @@ class OCI(clouds.Cloud):
                 disk_tier=resources.disk_tier)
 
             if default_instance_type is None:
-                return ([], [])
+                return resources_utils.FeasibleResources([], [], None)
             else:
-                return (_make([default_instance_type]), [])
+                return resources_utils.FeasibleResources(
+                    _make([default_instance_type]), [], None)
 
         assert len(accelerators) == 1, resources
 
@@ -344,9 +349,11 @@ class OCI(clouds.Cloud):
             zone=resources.zone,
             clouds='oci')
         if instance_list is None:
-            return ([], fuzzy_candidate_list)
+            return resources_utils.FeasibleResources([], fuzzy_candidate_list,
+                                                     None)
 
-        return (_make(instance_list), fuzzy_candidate_list)
+        return resources_utils.FeasibleResources(_make(instance_list),
+                                                 fuzzy_candidate_list, None)
 
     @classmethod
     def check_credentials(cls) -> Tuple[bool, Optional[str]]:
@@ -409,6 +416,19 @@ class OCI(clouds.Cloud):
                 f'{cls._INDENT_PREFIX}Error details: '
                 f'{common_utils.format_exception(e, use_bracket=True)}')
 
+    @classmethod
+    def check_disk_tier(
+            cls, instance_type: Optional[str],
+            disk_tier: Optional[resources_utils.DiskTier]) -> Tuple[bool, str]:
+        del instance_type  # Unused.
+        if disk_tier is None or disk_tier == resources_utils.DiskTier.BEST:
+            return True, ''
+        if disk_tier == resources_utils.DiskTier.ULTRA:
+            return False, ('OCI disk_tier=ultra is not supported now. '
+                           'Please use disk_tier={low, medium, high, best} '
+                           'instead.')
+        return True, ''
+
     def get_credential_file_mounts(self) -> Dict[str, str]:
         """Returns a dict of credential file paths to mount paths."""
         oci_cfg_file = oci_adaptor.get_config_file()
@@ -435,7 +455,7 @@ class OCI(clouds.Cloud):
         return file_mounts
 
     @classmethod
-    def get_current_user_identity(cls) -> Optional[List[str]]:
+    def get_user_identities(cls) -> Optional[List[List[str]]]:
         # NOTE: used for very advanced SkyPilot functionality
         # Can implement later if desired
         # If the user switches the compartment_ocid, the existing clusters
